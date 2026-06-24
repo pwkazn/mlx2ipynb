@@ -5,9 +5,10 @@ Convert MATLAB Live Script (`.mlx`) to Jupyter Notebook (`.ipynb`), MATLAB scrip
 ## Usage
 
 ```bash
-python mlx2ipynb.py file.mlx              # all formats
-python mlx2ipynb.py file.mlx -f ipynb     # notebook only
-python mlx2ipynb.py file.mlx -f ipynb md  # selective
+python mlx2ipynb.py file.mlx                     # all formats
+python mlx2ipynb.py file.mlx -f ipynb            # notebook only
+python mlx2ipynb.py file.mlx -f ipynb md         # selective
+python mlx2ipynb.py file.mlx --forbid-html       # suppress HTML in output
 ```
 
 ## Output formats

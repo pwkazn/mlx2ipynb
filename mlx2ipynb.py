@@ -44,9 +44,16 @@ class InlineImage:
 
 
 @dataclass
+class InlineEquation:
+    text: str = ""
+    display: bool = True
+    mml: str = ""
+
+
+@dataclass
 class Paragraph:
     style: str = "text"
-    runs: list[Run | InlineImage] = field(default_factory=list)
+    runs: list[Run | InlineImage | InlineEquation] = field(default_factory=list)
     num_id: str | None = None
     align: str | None = None
 
@@ -64,6 +71,7 @@ class MlixFile:
     output_xml: str = ""
     rels: dict[str, str] = field(default_factory=dict)
     media: dict[str, bytes] = field(default_factory=dict)
+    mathml: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +110,14 @@ def read_mlx(path: Path) -> MlixFile:
             if name.startswith("media/") and not name.endswith("/"):
                 mlx.media[name] = z.read(name)
 
+        # Read MathML equation files
+        for name in z.namelist():
+            if name.startswith("mathml/") and not name.endswith("/"):
+                try:
+                    mlx.mathml[name] = z.read(name).decode("utf-8")
+                except (UnicodeDecodeError, LookupError):
+                    pass
+
     return mlx
 
 
@@ -137,9 +153,9 @@ def _get_style(p_elem: ET.Element) -> str:
     return "text"
 
 
-def _parse_runs(p_elem: ET.Element) -> list[Run | InlineImage]:
+def _parse_runs(p_elem: ET.Element, mlx: MlixFile) -> list[Run | InlineImage | InlineEquation]:
     """Extract runs (w:r, w:customXml) from a w:p element."""
-    items: list[Run | InlineImage] = []
+    items: list[Run | InlineImage | InlineEquation] = []
 
     for child in p_elem:
         tag = child.tag
@@ -172,11 +188,11 @@ def _parse_runs(p_elem: ET.Element) -> list[Run | InlineImage]:
                     sdt_content = sdt.find(_ns("w:sdtContent"))
                     if sdt_content is not None:
                         for p2 in sdt_content.findall(_ns("w:p")):
-                            items.extend(_parse_runs(p2))
+                            items.extend(_parse_runs(p2, mlx))
                 else:
                     # Direct w:p in alternate content
                     for p2 in ac_child.findall(_ns("w:p")):
-                        items.extend(_parse_runs(p2))
+                        items.extend(_parse_runs(p2, mlx))
 
         # Inline image
         elif (
@@ -190,6 +206,36 @@ def _parse_runs(p_elem: ET.Element) -> list[Run | InlineImage]:
                     if attr.attrib.get(f"{{{NS['w']}}}name", "") == "relationshipId":
                         img.rel_id = attr.attrib.get(f"{{{NS['w']}}}val", "")
             items.append(img)
+
+        # Inline equation (MathML)
+        elif (
+            tag == _ns("w:customXml")
+            and child.attrib.get(f"{{{NS['w']}}}element", "") == "equation"
+        ):
+            display = True
+            mml_rid: str | None = None
+            cxml_pr = child.find(_ns("w:customXmlPr"))
+            if cxml_pr is not None:
+                for attr in cxml_pr.findall(_ns("w:attr")):
+                    name = attr.attrib.get(f"{{{NS['w']}}}name", "")
+                    if name == "displayStyle":
+                        display = attr.attrib.get(f"{{{NS['w']}}}val", "true") == "true"
+                    elif name == "relationshipId":
+                        mml_rid = attr.attrib.get(f"{{{NS['w']}}}val", "")
+
+            eq_texts: list[str] = []
+            for r in child.findall(_ns("w:r")):
+                for t in r.iter(_ns("w:t")):
+                    if t.text:
+                        eq_texts.append(t.text)
+            if eq_texts:
+                eq = InlineEquation(text="".join(eq_texts), display=display)
+                if mml_rid:
+                    mml_target = mlx.rels.get(mml_rid, "")
+                    mml_key = mml_target.replace("\\", "/").lstrip("../")
+                    if mml_key in mlx.mathml:
+                        eq.mml = mlx.mathml[mml_key]
+                items.append(eq)
 
         # DrawingML image (inline)
         elif tag == _ns("w:r"):
@@ -263,7 +309,7 @@ def parse_cells(mlx: MlixFile) -> list[Cell]:
     paragraphs: list[Paragraph] = []
     for p_elem in body.findall(_ns("w:p")):
         style = _get_style(p_elem)
-        runs = _parse_runs(p_elem)
+        runs = _parse_runs(p_elem, mlx)
 
         # Skip completely empty paragraphs
         if not runs and style == "text":
@@ -326,7 +372,7 @@ def parse_cells(mlx: MlixFile) -> list[Cell]:
             for item in p.runs:
                 if isinstance(item, Run) and item.text.strip():
                     return True
-                if isinstance(item, InlineImage):
+                if isinstance(item, (InlineImage, InlineEquation)):
                     return True
         return False
 
@@ -398,15 +444,18 @@ def _escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def run_to_markdown(run: Run) -> str:
-    """Convert a single Run to markdown text."""
+def run_to_markdown(run: Run, forbid_html: bool = False, use_html: bool = False) -> str:
+    """Convert a single Run to markdown text.
+    When use_html=True, the output is embedded inside an HTML block
+    (e.g. alignment div), so HTML escaping is used instead of markdown escaping.
+    """
     text = run.text
     if not text:
         return ""
 
     needs_html = run.underline or (run.monospace and (run.bold or run.italic))
 
-    if needs_html:
+    if needs_html and not forbid_html:
         text = _escape_html(text)
         if run.monospace:
             text = f"<code>{text}</code>"
@@ -416,6 +465,16 @@ def run_to_markdown(run: Run) -> str:
             text = f"<strong>{text}</strong>"
         if run.underline:
             text = f"<u>{text}</u>"
+        return text
+
+    if use_html:
+        text = _escape_html(text)
+        if run.monospace:
+            text = f"<code>{text}</code>"
+        if run.italic:
+            text = f"<em>{text}</em>"
+        if run.bold:
+            text = f"<strong>{text}</strong>"
         return text
 
     text = _escape_md(text)
@@ -439,15 +498,17 @@ def paragraph_to_markdown(
     rels: dict[str, str],
     mlx: MlixFile | None = None,
     use_html: bool = False,
+    forbid_html: bool = False,
 ) -> str:
     """Convert a Paragraph to a markdown string.
     Set use_html=True when this text will be embedded inside an HTML block
     (e.g. alignment divs), so images use <img> instead of markdown ![]().
+    Set forbid_html=True to suppress ALL HTML output (no <u>, <img>, etc.).
     """
     parts: list[str] = []
     for item in p.runs:
         if isinstance(item, Run):
-            parts.append(run_to_markdown(item))
+            parts.append(run_to_markdown(item, forbid_html=forbid_html, use_html=use_html))
         elif isinstance(item, InlineImage):
             target = rels.get(item.rel_id, "")
             if target and mlx is not None:
@@ -459,7 +520,15 @@ def paragraph_to_markdown(
                     src = f"data:image/png;base64,{b64}"
                 else:
                     src = target
-                parts.append(_img_html(src) if use_html else f"![image]({src})")
+                img_md = f"![image]({src})"
+                parts.append(
+                    _img_html(src) if (use_html and not forbid_html) else img_md
+                )
+        elif isinstance(item, InlineEquation):
+            if item.display:
+                parts.append(f"$$\n{item.text}\n$$")
+            else:
+                parts.append(f"${item.text}$")
     return "".join(parts)
 
 
@@ -471,6 +540,8 @@ def paragraph_to_plain(p: Paragraph, rels: dict[str, str]) -> str:
             parts.append(item.text)
         elif isinstance(item, InlineImage):
             parts.append("[image]")
+        elif isinstance(item, InlineEquation):
+            parts.append(item.text)
     return "".join(parts)
 
 
@@ -491,21 +562,31 @@ def _heading_level(style: str) -> int:
 
 
 def text_cell_to_markdown(
-    cell: Cell, rels: dict[str, str], mlx: MlixFile | None = None
+    cell: Cell,
+    rels: dict[str, str],
+    mlx: MlixFile | None = None,
+    forbid_html: bool = False,
 ) -> str:
     """Convert a text cell (multiple Paragraphs) to a markdown block."""
     md_paragraphs: list[str] = []
     for p in cell.paragraphs:
-        in_html = bool(p.align and p.align != "left")
-        text = paragraph_to_markdown(p, rels, mlx, use_html=in_html)
+        in_html = bool(p.align and p.align != "left") and not forbid_html
+        text = paragraph_to_markdown(
+            p, rels, mlx, use_html=in_html, forbid_html=forbid_html
+        )
         style = p.style
         stripped = text.strip()
         if not stripped:
             continue
 
+        is_eq = any(isinstance(item, InlineEquation) for item in p.runs)
         level = _heading_level(style)
-        if level:
-            if p.align and p.align != "left":
+        if is_eq and any(
+            isinstance(item, InlineEquation) and item.display for item in p.runs
+        ) and not any(isinstance(item, Run) for item in p.runs):
+            md_paragraphs.append(stripped)
+        elif level:
+            if p.align and p.align != "left" and not forbid_html:
                 md_paragraphs.append(
                     f'<h{level} style="text-align:{p.align}">{stripped}</h{level}>'
                 )
@@ -514,7 +595,7 @@ def text_cell_to_markdown(
         elif style == "ListParagraph":
             prefix = "1. " if p.num_id and p.num_id != "1" else "- "
             md_paragraphs.append(f"{prefix}{stripped}")
-        elif p.align and p.align != "left":
+        elif p.align and p.align != "left" and not forbid_html:
             html_align = f' style="text-align:{p.align}"'
             md_paragraphs.append(f"<div{html_align}>{stripped}</div>")
         else:
@@ -539,13 +620,15 @@ def code_cell_to_text(cell: Cell) -> str:
 # ---------------------------------------------------------------------------
 # Writers
 # ---------------------------------------------------------------------------
-def write_ipynb(cells: list[Cell], mlx: MlixFile, path: Path) -> None:
+def write_ipynb(
+    cells: list[Cell], mlx: MlixFile, path: Path, forbid_html: bool = False
+) -> None:
     """Write a Jupyter Notebook (.ipynb)."""
     nb_cells: list[dict[str, Any]] = []
 
     for cell in cells:
         if cell.kind == "text":
-            source = text_cell_to_markdown(cell, mlx.rels, mlx)
+            source = text_cell_to_markdown(cell, mlx.rels, mlx, forbid_html=forbid_html)
             if not source.strip():
                 continue
             nb_cells.append(
@@ -635,13 +718,15 @@ def write_m(cells: list[Cell], path: Path) -> None:
     path.write_text("\n\n".join(code_blocks) + "\n", encoding="utf-8")
 
 
-def write_md(cells: list[Cell], mlx: MlixFile, path: Path) -> None:
+def write_md(
+    cells: list[Cell], mlx: MlixFile, path: Path, forbid_html: bool = False
+) -> None:
     """Write Markdown (.md) with rich text and fenced code blocks."""
     md_parts: list[str] = []
 
     for cell in cells:
         if cell.kind == "text":
-            md = text_cell_to_markdown(cell, mlx.rels, mlx)
+            md = text_cell_to_markdown(cell, mlx.rels, mlx, forbid_html=forbid_html)
             if md.strip():
                 md_parts.append(md)
         else:
@@ -675,6 +760,11 @@ def main() -> None:
         default=None,
         help="Output file or directory (default: same as input with new extension)",
     )
+    parser.add_argument(
+        "--forbid-html",
+        action="store_true",
+        help="Suppress all HTML in output (no <u>, <img>, <div> alignment, etc.)",
+    )
     args = parser.parse_args()
 
     input_path: Path = args.input
@@ -701,7 +791,7 @@ def main() -> None:
     map_outputs_to_cells(cells, outputs)
     print(f"Found {len(outputs)} outputs")
 
-    stem = input_path.stem
+    forbid = args.forbid_html
 
     if "ipynb" in formats:
         out = (
@@ -709,7 +799,7 @@ def main() -> None:
             if args.output
             else input_path.with_suffix(".ipynb")
         )
-        write_ipynb(cells, mlx, out)
+        write_ipynb(cells, mlx, out, forbid_html=forbid)
         print(f"  Wrote {out}")
 
     if "m" in formats:
@@ -727,7 +817,7 @@ def main() -> None:
             if args.output
             else input_path.with_suffix(".md")
         )
-        write_md(cells, mlx, out)
+        write_md(cells, mlx, out, forbid_html=forbid)
         print(f"  Wrote {out}")
 
     print("Done.")
